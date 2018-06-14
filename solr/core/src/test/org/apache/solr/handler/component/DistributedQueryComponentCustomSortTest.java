@@ -119,4 +119,36 @@ public class DistributedQueryComponentCustomSortTest extends BaseDistributedSear
     rsp = query("q", "*:*", "fl", "id", "sort", "payload desc, id_i asc", "rows", "20");
     assertFieldValues(rsp.getResults(), id, "11", "13", "8", "9", "5", "3", "12",   "10","16","17","18",   "2",   "4","14","15",   "6", "1", "7");
   }
+
+  @Test
+  @ShardsFixed(num = 3)
+  public void testMultiValuedSort() throws Exception {
+    del("*:*");
+    Object[] obj1 = intArray(1, 5);
+    Object[] obj2 = intArray(10, 5);
+    Object[] obj3 = intArray(100, 5);
+
+    index(id, "1", "int_point_field", obj1, "trie_int_field", obj1, "payload", ByteBuffer.wrap(new byte[] { 0x25, 0x21, 0x16 }));
+    index(id, "2", "int_point_field", obj2, "trie_int_field", obj2, "payload", ByteBuffer.wrap(new byte[] { 0x35, 0x32, 0x58 }));
+    index(id, "3", "int_point_field", obj3, "trie_int_field", obj3, "payload", ByteBuffer.wrap(new byte[] { 0x25, 0x21, 0x15 }));
+
+    commit();
+
+    QueryResponse rsp = query("q", "*:*", "fl", "id", "sort", "field(int_point_field,max) asc", "rows", "20");
+    assertFieldValues(rsp.getResults(), id, "1", "2", "3");
+
+    rsp = query("q", "*:*", "fl", "id", "sort", "field(trie_int_field,max) asc", "rows", "20");
+    assertFieldValues(rsp.getResults(), id, "1", "2", "3");
+
+  }
+
+  private static Object[] intArray(int addendum, int size) {
+    Object[] obj = new Object[size];
+    int value = addendum;
+    for (int i = 0; i < size  ; i++) {
+      obj[i] = value;
+      value += addendum;
+    }
+    return obj;
+  }
 }

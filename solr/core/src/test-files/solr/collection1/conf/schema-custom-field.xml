@@ -41,4 +41,11 @@
   <!-- catchall wildcard to help ensure we aren't breaking function sorting -->
   <dynamicField name="*" type="string" indexed="true" stored="true"/>
   <uniqueKey>id</uniqueKey>
+
+  <field name="trie_int_field" type="tint" indexed="true" stored="true" multiValued="true" docValues="true"/>
+  <fieldType class="solr.TrieIntField" docValues="true" name="tint" positionIncrementGap="0" precisionStep="0"/>
+
+  <field name="int_point_field" type="pint" indexed="true" stored="true" multiValued="true" />
+  <fieldType name="pint" class="solr.IntPointField" docValues="true"/>
+
 </schema>
