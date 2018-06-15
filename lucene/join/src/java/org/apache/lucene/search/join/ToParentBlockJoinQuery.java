@@ -68,6 +68,7 @@ public class ToParentBlockJoinQuery extends Query {
   private final BitSetProducer parentsFilter;
   private final Query childQuery;
   private final ScoreMode scoreMode;
+  private final int minMatchedChildrenCount;
 
   /** Create a ToParentBlockJoinQuery.
    *
@@ -77,15 +78,30 @@ public class ToParentBlockJoinQuery extends Query {
    * into a single parent score.
    **/
   public ToParentBlockJoinQuery(Query childQuery, BitSetProducer parentsFilter, ScoreMode scoreMode) {
+    this(childQuery, parentsFilter, scoreMode, 1);
+  }
+
+  /**
+   * Create a ToParentBlockJoinQuery.
+   *
+   * @param childQuery    Query matching child documents.
+   * @param parentsFilter Filter identifying the parent documents.
+   * @param scoreMode     How to aggregate multiple child scores
+   *                      into a single parent score.
+   * @param minMatchedChildrenCount minimum number of children which should be matched
+   **/
+  public ToParentBlockJoinQuery(Query childQuery, BitSetProducer parentsFilter, ScoreMode scoreMode, int minMatchedChildrenCount) {
     super();
     this.childQuery = childQuery;
     this.parentsFilter = parentsFilter;
     this.scoreMode = scoreMode;
+    this.minMatchedChildrenCount = minMatchedChildrenCount;
   }
 
   @Override
   public Weight createWeight(IndexSearcher searcher, org.apache.lucene.search.ScoreMode weightScoreMode, float boost) throws IOException {
-    return new BlockJoinWeight(this, childQuery.createWeight(searcher, weightScoreMode, boost), parentsFilter, weightScoreMode.needsScores() ? scoreMode : ScoreMode.None);
+    return new BlockJoinWeight(this, childQuery.createWeight(searcher, weightScoreMode, boost),
+        parentsFilter, weightScoreMode.needsScores() ? scoreMode : ScoreMode.None, minMatchedChildrenCount);
   }
 
   /** Return our child query. */
@@ -96,11 +112,13 @@ public class ToParentBlockJoinQuery extends Query {
   private static class BlockJoinWeight extends FilterWeight {
     private final BitSetProducer parentsFilter;
     private final ScoreMode scoreMode;
+    private final int minMatchedChildrenCount;
 
-    public BlockJoinWeight(Query joinQuery, Weight childWeight, BitSetProducer parentsFilter, ScoreMode scoreMode) {
+    public BlockJoinWeight(Query joinQuery, Weight childWeight, BitSetProducer parentsFilter, ScoreMode scoreMode, int minMatchedChildrenCount) {
       super(joinQuery, childWeight);
       this.parentsFilter = parentsFilter;
       this.scoreMode = scoreMode;
+      this.minMatchedChildrenCount = minMatchedChildrenCount;
     }
 
     @Override
@@ -133,7 +151,7 @@ public class ToParentBlockJoinQuery extends Query {
 
         @Override
         public Scorer get(long leadCost) throws IOException {
-          return new BlockJoinScorer(BlockJoinWeight.this, childScorerSupplier.get(leadCost), parents, scoreMode);
+          return new BlockJoinScorer(BlockJoinWeight.this, childScorerSupplier.get(leadCost), parents, scoreMode, minMatchedChildrenCount);
         }
 
         @Override
@@ -155,9 +173,9 @@ public class ToParentBlockJoinQuery extends Query {
 
   private static class ParentApproximation extends DocIdSetIterator {
 
-    private final DocIdSetIterator childApproximation;
-    private final BitSet parentBits;
-    private int doc = -1;
+    final DocIdSetIterator childApproximation;
+    final BitSet parentBits;
+    int doc = -1;
 
     ParentApproximation(DocIdSetIterator childApproximation, BitSet parentBits) {
       this.childApproximation = childApproximation;
@@ -179,15 +197,20 @@ public class ToParentBlockJoinQuery extends Query {
       if (target >= parentBits.length()) {
         return doc = NO_MORE_DOCS;
       }
+      int childDoc = nextTargetChildren(target);
+      if (childDoc >= parentBits.length() - 1) {
+        return doc = NO_MORE_DOCS;
+      }
+      return doc = parentBits.nextSetBit(childDoc + 1);
+    }
+
+    int nextTargetChildren(int target) throws IOException {
       final int firstChildTarget = target == 0 ? 0 : parentBits.prevSetBit(target - 1) + 1;
       int childDoc = childApproximation.docID();
       if (childDoc < firstChildTarget) {
         childDoc = childApproximation.advance(firstChildTarget);
       }
-      if (childDoc >= parentBits.length() - 1) {
-        return doc = NO_MORE_DOCS;
-      }
-      return doc = parentBits.nextSetBit(childDoc + 1);
+      return childDoc;
     }
 
     @Override
@@ -196,11 +219,40 @@ public class ToParentBlockJoinQuery extends Query {
     }
   }
 
-  private static class ParentTwoPhase extends TwoPhaseIterator {
+  private static class ParentApproximationWithMinMatchedChildrenCount extends ParentApproximation {
+    private final int minChildrenCount;
 
-    private final ParentApproximation parentApproximation;
-    private final DocIdSetIterator childApproximation;
-    private final TwoPhaseIterator childTwoPhase;
+    ParentApproximationWithMinMatchedChildrenCount(DocIdSetIterator childApproximation, BitSet parentBits, int minChildrenCount) {
+      super(childApproximation, parentBits);
+      this.minChildrenCount = minChildrenCount;
+    }
+
+    @Override
+    public int advance(int target) throws IOException {
+      if (target >= parentBits.length()) {
+        return doc = NO_MORE_DOCS;
+      }
+      int childDoc = nextTargetChildren(target);
+      int parent = childDoc + 1;
+      while (childDoc < parentBits.length() - 1 && parent < parentBits.length() - 1) {
+        parent = parentBits.nextSetBit(parent + 1);
+        int matchedChildrenCount = 0;
+        while (childDoc < parent) {
+          matchedChildrenCount++;
+          childDoc = childApproximation.nextDoc();
+          if (matchedChildrenCount >= minChildrenCount) {
+            return doc = parent;
+          }
+        }
+      }
+      return doc = NO_MORE_DOCS;
+    }
+  }
+
+  private static class ParentTwoPhase extends TwoPhaseIterator {
+    final ParentApproximation parentApproximation;
+    final DocIdSetIterator childApproximation;
+    final TwoPhaseIterator childTwoPhase;
 
     ParentTwoPhase(ParentApproximation parentApproximation, TwoPhaseIterator childTwoPhase) {
       super(parentApproximation);
@@ -227,6 +279,33 @@ public class ToParentBlockJoinQuery extends Query {
     }
   }
 
+  private static class ParentTwoPhaseWithMinMatchedChildren extends ParentTwoPhase {
+
+    private final int minChildrenCount;
+
+    ParentTwoPhaseWithMinMatchedChildren(ParentApproximation parentApproximation,
+                                         TwoPhaseIterator childTwoPhase, int minChildrenCount) {
+      super(parentApproximation, childTwoPhase);
+      this.minChildrenCount = minChildrenCount;
+    }
+
+    @Override
+    public boolean matches() throws IOException {
+      assert childApproximation.docID() < parentApproximation.docID();
+      int childrenMatchedCount = 0;
+      do {
+        if (childTwoPhase.matches()) {
+          childrenMatchedCount++;
+        }
+        if (childrenMatchedCount >= minChildrenCount) {
+          return true;
+        }
+      } while (childApproximation.nextDoc() < parentApproximation.docID());
+      return false;
+    }
+
+  }
+
   static class BlockJoinScorer extends Scorer {
     private final Scorer childScorer;
     private final BitSet parentBits;
@@ -237,21 +316,24 @@ public class ToParentBlockJoinQuery extends Query {
     private final ParentTwoPhase parentTwoPhase;
     private float score;
 
-    public BlockJoinScorer(Weight weight, Scorer childScorer, BitSet parentBits, ScoreMode scoreMode) {
+    public BlockJoinScorer(Weight weight, Scorer childScorer, BitSet parentBits, ScoreMode scoreMode, int minChildrenCountToMatch) {
       super(weight);
-      //System.out.println("Q.init firstChildDoc=" + firstChildDoc);
       this.parentBits = parentBits;
       this.childScorer = childScorer;
       this.scoreMode = scoreMode;
       childTwoPhase = childScorer.twoPhaseIterator();
       if (childTwoPhase == null) {
         childApproximation = childScorer.iterator();
-        parentApproximation = new ParentApproximation(childApproximation, parentBits);
+        parentApproximation = minChildrenCountToMatch > 1
+            ? new ParentApproximationWithMinMatchedChildrenCount(childApproximation, parentBits, minChildrenCountToMatch)
+            : new ParentApproximation(childApproximation, parentBits);
         parentTwoPhase = null;
       } else {
         childApproximation = childTwoPhase.approximation();
         parentApproximation = new ParentApproximation(childTwoPhase.approximation(), parentBits);
-        parentTwoPhase = new ParentTwoPhase(parentApproximation, childTwoPhase);
+        parentTwoPhase = minChildrenCountToMatch > 1
+            ? new ParentTwoPhaseWithMinMatchedChildren(parentApproximation, childTwoPhase, minChildrenCountToMatch)
+            : new ParentTwoPhase(parentApproximation, childTwoPhase);
       }
     }
 
@@ -364,8 +446,7 @@ public class ToParentBlockJoinQuery extends Query {
     final Query childRewrite = childQuery.rewrite(reader);
     if (childRewrite != childQuery) {
       return new ToParentBlockJoinQuery(childRewrite,
-                                parentsFilter,
-                                scoreMode);
+                                parentsFilter, scoreMode, minMatchedChildrenCount);
     } else {
       return super.rewrite(reader);
     }
@@ -385,7 +466,8 @@ public class ToParentBlockJoinQuery extends Query {
   private boolean equalsTo(ToParentBlockJoinQuery other) {
     return childQuery.equals(other.childQuery) &&
            parentsFilter.equals(other.parentsFilter) &&
-           scoreMode == other.scoreMode;
+           scoreMode == other.scoreMode &&
+           minMatchedChildrenCount == other.minMatchedChildrenCount;
   }
 
   @Override
@@ -395,6 +477,7 @@ public class ToParentBlockJoinQuery extends Query {
     hash = prime * hash + childQuery.hashCode();
     hash = prime * hash + scoreMode.hashCode();
     hash = prime * hash + parentsFilter.hashCode();
+    hash = prime * hash + minMatchedChildrenCount;
     return hash;
   }
 }
